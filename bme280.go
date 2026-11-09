@@ -37,6 +37,7 @@ const (
 	I2CAddr = 0x77
 
 	// Stand-by modes
+	// StandByTime1ms selects 0.5 ms; its name is retained for compatibility.
 	StandByTime1ms    StandByTime = 0x00
 	StandByTime62_5ms StandByTime = 0x01
 	StandByTime125ms  StandByTime = 0x02
@@ -68,6 +69,7 @@ const (
 	humidityCalibDataAddr  byte = 0xE1
 	pwrCtrlAddr            byte = 0xF4
 	ctrlHumAddr            byte = 0xF2
+	statusAddr             byte = 0xF3
 	ctrlMeasAddr           byte = 0xF4
 	configAddr             byte = 0xF5
 	dataAddr               byte = 0xF7
@@ -75,26 +77,14 @@ const (
 	chipId byte = 0x60
 )
 
-var oversamplingCoefs []float32
-
-func init() {
-	oversamplingCoefs = make([]float32, 8)
-
-	oversamplingCoefs[0] = 0.0
-	oversamplingCoefs[1] = 1.0
-	oversamplingCoefs[2] = 2.0
-	oversamplingCoefs[3] = 4.0
-	oversamplingCoefs[4] = 8.0
-	oversamplingCoefs[5] = 16.0
-	// As indicated in the datasheet 0x05 and higher values stand for x16 oversampling
-	oversamplingCoefs[6] = 16.0
-	oversamplingCoefs[7] = 16.0
-}
+// As indicated in the datasheet 0x05 and higher values stand for x16 oversampling.
+var oversamplingCoefs = [...]float32{0, 1, 2, 4, 8, 16, 16, 16}
 
 type Driver struct {
 	device      bus
 	mode        Mode // Desired operation mode
 	initialized bool
+	readyAt     time.Time // Earliest completion of a measurement since the last reset.
 	calib       struct {
 		t1    uint16
 		t2    int16
@@ -163,6 +153,7 @@ func (d *Driver) Init() error {
 				return err
 			}
 			retries--
+			time.Sleep(2 * time.Millisecond) // Allow the sensor's power-on startup to finish.
 			continue
 		}
 		break
@@ -198,7 +189,13 @@ func (d *Driver) InitWith(mode Mode, c Settings) error {
 	return d.SetMode(mode)
 }
 
+// SetSettings applies settings and restores the current device mode.
+// Values outside the three-bit register fields are rejected before accessing the device.
 func (d *Driver) SetSettings(s Settings) error {
+	if s.Filter > 7 || s.Standby > 7 || s.PressureOversampling > 7 || s.TemperatureOversampling > 7 || s.HumidityOversampling > 7 {
+		return fmt.Errorf("invalid sensor settings: %+v", s)
+	}
+
 	mode, err := d.GetMode()
 	if err != nil {
 		return err
@@ -211,34 +208,61 @@ func (d *Driver) SetSettings(s Settings) error {
 		}
 	}
 
-	return d.loadSettings(s)
+	if err := d.loadSettings(s); err != nil {
+		return err
+	}
+	if mode != ModeSleep {
+		return d.SetMode(mode)
+	}
+	return nil
 }
 
 func (d *Driver) SetMode(m Mode) error {
+	if m > ModeNormal {
+		return fmt.Errorf("invalid sensor mode: %d", m)
+	}
+	if m == 0x02 {
+		m = ModeForced // Both 01 and 10 select forced mode on the sensor.
+	}
+
 	lastMode, err := d.GetMode()
 	if err != nil {
 		return err
 	}
 
 	if lastMode != ModeSleep {
-		d.Sleep()
+		if err := d.Sleep(); err != nil {
+			return err
+		}
+	}
+
+	var measurementTime time.Duration
+	if m != ModeSleep {
+		s, err := d.GetSettings()
+		if err != nil {
+			return err
+		}
+		measurementTime = s.measurementTime()
 	}
 
 	buf := make([]byte, 1)
 	err = d.device.ReadReg(pwrCtrlAddr, buf)
 	if err != nil {
-		return nil
+		return err
 	}
 
 	buf[0] &^= 0x03
 	buf[0] |= byte(m & 0x03)
 
-	d.device.WriteReg(pwrCtrlAddr, buf)
+	err = d.device.WriteReg(pwrCtrlAddr, buf)
 	if err != nil {
-		return nil
+		return err
 	}
 
 	d.mode = m
+	if m != ModeSleep {
+		d.readyAt = time.Now().Add(measurementTime)
+	}
 
 	return nil
 }
@@ -312,20 +336,32 @@ func (d *Driver) Sleep() error {
 // Reads data from Device
 //
 // If ModeForced is selected an ad-hoc measurement is performed.
+// An error is returned if any channel is disabled or has no measurement yet.
 func (d *Driver) Read() (Response, error) {
 	if !d.initialized {
 		return Response{}, fmt.Errorf("driver uninitialized")
 	}
 
+	s, err := d.GetSettings()
+	if err != nil {
+		return Response{}, err
+	}
+	if s.TemperatureOversampling == OversamplingOff || s.PressureOversampling == OversamplingOff || s.HumidityOversampling == OversamplingOff {
+		return Response{}, fmt.Errorf("measurement unavailable: a channel is disabled")
+	}
+
 	if d.mode == ModeForced {
-		err := d.forceMeasurement()
+		err := d.forceMeasurement(s)
 		if err != nil {
 			return Response{}, err
 		}
 	}
+	if d.readyAt.IsZero() || time.Now().Before(d.readyAt) {
+		return Response{}, fmt.Errorf("measurement unavailable: not ready")
+	}
 
 	buf := make([]byte, 8)
-	err := d.device.ReadReg(dataAddr, buf)
+	err = d.device.ReadReg(dataAddr, buf)
 	if err != nil {
 		return Response{}, err
 	}
@@ -389,7 +425,7 @@ func (d *Driver) compensatePressure(u uint32) float64 {
 	v1 = (v3 + v1) * int64(d.calib.p1) / 8589934592
 
 	if v1 == 0 {
-		return float64(pmin) / 100.0
+		return float64(pmin) / 100.0 / 100.0
 	}
 
 	v4 := int64(1048576) - int64(u)
@@ -398,7 +434,7 @@ func (d *Driver) compensatePressure(u uint32) float64 {
 	v2 = int64(d.calib.p8) * v4 / 524288
 	v4 = ((v4 + v1 + v2) / 256) + int64(d.calib.p7)*16
 
-	pressure := uint32(v4/2) * 100 / 128
+	pressure := uint32((v4 / 2) * 100 / 128)
 
 	if pressure < pmin {
 		pressure = pmin
@@ -410,8 +446,6 @@ func (d *Driver) compensatePressure(u uint32) float64 {
 }
 
 func (d *Driver) compensateHumidity(u uint32) float64 {
-	var hmax uint32 = 100000
-
 	v1 := d.calib.tFine - int32(76800)
 	v2 := int32(u * 16384)
 	v3 := int32(d.calib.h4) * 1048576
@@ -435,11 +469,7 @@ func (d *Driver) compensateHumidity(u uint32) float64 {
 
 	humidity := uint32(v5 / 4096)
 
-	if humidity > hmax {
-		humidity = hmax
-	}
-
-	return float64(humidity) / 1000.0
+	return float64(humidity) / 1024.0
 }
 
 func (d *Driver) softReset() error {
@@ -449,9 +479,19 @@ func (d *Driver) softReset() error {
 	if err != nil {
 		return err
 	}
+	d.readyAt = time.Time{}
 
-	time.Sleep(2 * time.Millisecond) // As per specification, wait 2 milliseconds
-	return nil
+	buf := make([]byte, 1)
+	for range 5 {
+		time.Sleep(2 * time.Millisecond)
+		if err := d.device.ReadReg(statusAddr, buf); err != nil {
+			return err
+		}
+		if buf[0]&0x01 == 0 {
+			return nil
+		}
+	}
+	return fmt.Errorf("sensor calibration reload timed out")
 }
 
 func (d *Driver) readCalibData() error {
@@ -484,14 +524,14 @@ func (d *Driver) readCalibData() error {
 
 	d.calib.h2 = int16(binary.LittleEndian.Uint16(buf))
 	d.calib.h3 = buf[2]
-	d.calib.h4 = int16(buf[3])*16 | int16(buf[4]&0x0F)
-	d.calib.h5 = int16(int8(buf[5])*16) | int16(buf[4]>>4)
+	d.calib.h4 = int16(int8(buf[3]))*16 | int16(buf[4]&0x0F)
+	d.calib.h5 = int16(int8(buf[5]))*16 | int16(buf[4]>>4)
 	d.calib.h6 = int8(buf[6])
 
 	return nil
 }
 
-func (d *Driver) forceMeasurement() error {
+func (d *Driver) forceMeasurement(s Settings) error {
 	lastMode, err := d.GetMode()
 	if err != nil {
 		return err
@@ -499,10 +539,16 @@ func (d *Driver) forceMeasurement() error {
 	if lastMode == ModeNormal {
 		return fmt.Errorf("sensor in normal mode, cannot force measurement")
 	}
-
-	s, err := d.GetSettings()
-	if err != nil {
-		return err
+	// Allow 120 ms for the maximum 112.8 ms conversion already in progress.
+	for attempts := 0; lastMode != ModeSleep; attempts++ {
+		if attempts == 60 {
+			return fmt.Errorf("sensor forced measurement timed out")
+		}
+		time.Sleep(2 * time.Millisecond)
+		lastMode, err = d.GetMode()
+		if err != nil {
+			return err
+		}
 	}
 
 	buf := make([]byte, 1)
@@ -520,15 +566,30 @@ func (d *Driver) forceMeasurement() error {
 		return err
 	}
 
+	measurementTime := s.measurementTime()
+	d.readyAt = time.Now().Add(measurementTime)
+	time.Sleep(measurementTime)
+	for attempts := 0; ; attempts++ {
+		if err := d.device.ReadReg(statusAddr, buf); err != nil {
+			return err
+		}
+		if buf[0]&0x08 == 0 {
+			return nil
+		}
+		if attempts == 5 {
+			return fmt.Errorf("sensor forced measurement timed out")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func (s Settings) measurementTime() time.Duration {
 	// Using the max measurement time formula
 	tempMeasTime := 2.3 * oversamplingCoefs[int(s.TemperatureOversampling)]
 	pressureMeasTime := 2.3*oversamplingCoefs[int(s.PressureOversampling)] + 0.575
 	humidityMeasTime := 2.3*oversamplingCoefs[int(s.HumidityOversampling)] + 0.575
 	measTime := 1.25 + tempMeasTime + pressureMeasTime + humidityMeasTime
-	measTimeMicros := time.Duration(math.Ceil(float64(measTime * 1000)))
-
-	time.Sleep(measTimeMicros * time.Microsecond)
-	return nil
+	return time.Duration(math.Ceil(float64(measTime*1000))) * time.Microsecond
 }
 
 func (d *Driver) loadSettings(s Settings) error {
@@ -539,6 +600,7 @@ func (d *Driver) loadSettings(s Settings) error {
 	if err != nil {
 		return err
 	}
+	d.readyAt = time.Time{}
 
 	// Reference set_osr_humidity_settings writes to ctrlMeas register here
 	// However since we guarantee (communication errors aside) that the function
