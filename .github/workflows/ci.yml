@@ -12,6 +12,9 @@ jobs:
   test:
     name: Test (Go ${{ matrix.go-version }}, ${{ matrix.arch }})
     runs-on: ${{ matrix.runs-on }}
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -34,8 +37,15 @@ jobs:
         with:
           go-version: ${{ matrix.go-version }}
       - run: ./format_check.sh
-      - run: go test ./...
+      - run: go test -coverprofile=coverage.out ./...
       - run: go build ./...
+      - name: Upload coverage
+        if: matrix.go-version == 'stable' && matrix.arch == 'amd64' && github.ref == 'refs/heads/main'
+        uses: codecov/codecov-action@v7
+        with:
+          files: coverage.out
+          use_oidc: true
+          fail_ci_if_error: true
 
   build-arm32:
     name: Build (Go ${{ matrix.go-version }}, arm)
